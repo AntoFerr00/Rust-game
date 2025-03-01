@@ -1,8 +1,18 @@
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use bevy::time::Time;
-use rand::Rng; // Ensure this is added to your Cargo.toml dependencies
 use bevy::window::{PrimaryWindow, Window};
+use rand::Rng;
+
+// Constants for gameplay tuning.
+const PLAYER_SIZE: Vec2 = Vec2::new(30.0, 30.0);
+const PLAYER_SPEED: f32 = 200.0;
+const PLAYER_JUMP_VELOCITY: f32 = 300.0;
+const ENEMY_SIZE: Vec2 = Vec2::new(30.0, 30.0);
+const ENEMY_SPEED_RANGE: (f32, f32) = (50.0, 150.0);
+const OBSTACLE_SIZE: Vec2 = Vec2::new(40.0, 40.0);
+const GROUND_HEIGHT: f32 = 20.0;
+const GRAVITY_FORCE: f32 = -500.0;
 
 #[derive(Resource)]
 pub struct Gravity(pub f32);
@@ -28,15 +38,22 @@ struct ScoreText;
 #[derive(Component, Deref, DerefMut)]
 struct Velocity(Vec2);
 
+#[derive(Resource)]
+pub struct GroundData {
+    pub center_y: f32,
+    pub top_y: f32,
+    pub height: f32,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(Gravity(-500.0))
+        .insert_resource(Gravity(GRAVITY_FORCE))
         .insert_resource(Score(0))
         .insert_resource(GroundData {
             center_y: 0.0,
-            top_y: 0.0,
-            height: 0.0,
+            top_y: GROUND_HEIGHT / 2.0,
+            height: GROUND_HEIGHT,
         })
         .add_systems(Startup, setup)
         .add_systems(Startup, spawn_enemies.after(setup))
@@ -44,7 +61,10 @@ fn main() {
         .add_systems(Update, player_input_system)
         .add_systems(Update, apply_gravity_system)
         .add_systems(Update, movement_system)
-        .add_systems(Update, player_wrap_system) // wrap-around system
+        .add_systems(Update, player_wrap_system) // wrap-around for player
+        .add_systems(Update, enemy_wrap_system)  // wrap-around for enemies
+        // NEW: Enemy-obstacle collision system
+        .add_systems(Update, enemy_obstacle_collision_system)
         .add_systems(Update, collision_system)
         .add_systems(Update, enemy_collision_system)
         .add_systems(Update, obstacle_collision_system)
@@ -53,35 +73,31 @@ fn main() {
         .run();
 }
 
-#[derive(Resource)]
-pub struct GroundY(pub f32);
 
-#[derive(Resource)]
-pub struct GroundData {
-    pub center_y: f32,
-    pub top_y: f32,
-    pub height: f32,
-}
+//
+// SETUP SYSTEMS
+//
 
+/// Initializes the camera, ground, UI text, and player.
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     window_query: Query<&Window, With<PrimaryWindow>>,
 ) {
     let window = window_query.single();
-    let ground_height = 20.0;
-    // Calculate ground center and top positions.
-    // Place the ground so that its center is exactly at y = 0
-    let ground_center_y = 0.0; 
-    let ground_top_y = ground_center_y + ground_height / 2.0; // This ends up being ground_height / 2.0
 
+    // Calculate ground positions.
+    let ground_center_y = 0.0;
+    let ground_top_y = ground_center_y + GROUND_HEIGHT / 2.0;
+
+    // Update the GroundData resource.
     commands.insert_resource(GroundData {
         center_y: ground_center_y,
         top_y: ground_top_y,
-        height: ground_height,
+        height: GROUND_HEIGHT,
     });
 
-    // Spawn the camera.
+    // Spawn the 2D camera.
     commands.spawn(Camera2dBundle::default());
 
     // Spawn the ground.
@@ -89,19 +105,16 @@ fn setup(
         SpriteBundle {
             sprite: Sprite {
                 color: Color::rgb(0.2, 0.8, 0.2),
-                custom_size: Some(Vec2::new(window.width(), ground_height)),
+                custom_size: Some(Vec2::new(window.width(), GROUND_HEIGHT)),
                 ..default()
             },
-            transform: Transform {
-                translation: Vec3::new(0.0, 0.0, 0.0),
-                ..default()
-            },
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
             ..default()
         },
         Ground,
     ));
 
-    // Spawn the score UI text.
+    // Spawn score UI.
     commands.spawn((
         TextBundle {
             text: Text::from_section(
@@ -123,19 +136,17 @@ fn setup(
         ScoreText,
     ));
 
-    // Spawn the player so its bottom rests on the ground.
-    // For a 30x30 sprite, center = ground_top_y + 15.
+    // Spawn the player so its bottom touches the ground.
+    // Center is ground top + half the player height.
+    let player_y = ground_top_y + PLAYER_SIZE.y / 2.0;
     commands.spawn((
         SpriteBundle {
             texture: asset_server.load("player.png"),
             sprite: Sprite {
-                custom_size: Some(Vec2::new(30.0, 30.0)),
+                custom_size: Some(PLAYER_SIZE),
                 ..default()
             },
-            transform: Transform {
-                translation: Vec3::new(0.0, 0.0, 0.0),
-                ..default()
-            },
+            transform: Transform::from_translation(Vec3::new(0.0, player_y, 0.0)),
             ..default()
         },
         Player,
@@ -143,7 +154,7 @@ fn setup(
     ));
 }
 
-/// Spawn a random number of enemies at ground level.
+/// Spawns a random number of enemies with random horizontal velocities.
 fn spawn_enemies(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -153,31 +164,33 @@ fn spawn_enemies(
     let window = window_query.single();
     let mut rng = rand::thread_rng();
     let enemy_count = rng.gen_range(2..5);
-    let enemy_height = 30.0;
+    let enemy_y = ground_data.top_y + ENEMY_SIZE.y / 2.0;
 
     for _ in 0..enemy_count {
         let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
-        let enemy_pos = Vec3::new(x, ground_data.top_y + enemy_height / 2.0, 0.0);
+        let enemy_pos = Vec3::new(x, enemy_y, 0.0);
+
+        // Random horizontal speed and direction.
+        let speed = rng.gen_range(ENEMY_SPEED_RANGE.0..ENEMY_SPEED_RANGE.1);
+        let direction = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
 
         commands.spawn((
             SpriteBundle {
                 texture: asset_server.load("enemy.png"),
                 sprite: Sprite {
-                    custom_size: Some(Vec2::new(30.0, enemy_height)),
+                    custom_size: Some(ENEMY_SIZE),
                     ..default()
                 },
-                transform: Transform {
-                    translation: enemy_pos,
-                    ..default()
-                },
+                transform: Transform::from_translation(enemy_pos),
                 ..default()
             },
             Enemy,
+            Velocity(Vec2::new(direction * speed, 0.0)),
         ));
     }
 }
 
-/// Spawn a random number of obstacles at ground level.
+/// Spawns a random number of obstacles at ground level.
 fn spawn_obstacles(
     mut commands: Commands,
     ground_data: Res<GroundData>,
@@ -186,23 +199,20 @@ fn spawn_obstacles(
     let window = window_query.single();
     let mut rng = rand::thread_rng();
     let obstacle_count = rng.gen_range(3..7);
-    let obstacle_height = 40.0;
+    let obstacle_y = ground_data.top_y + OBSTACLE_SIZE.y / 2.0;
 
     for _ in 0..obstacle_count {
         let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
-        let obstacle_pos = Vec3::new(x, ground_data.top_y + (obstacle_height / 2.0), 0.0);
-        
+        let obstacle_pos = Vec3::new(x, obstacle_y, 0.0);
+
         commands.spawn((
             SpriteBundle {
                 sprite: Sprite {
                     color: Color::DARK_GRAY,
-                    custom_size: Some(Vec2::new(40.0, obstacle_height)),
+                    custom_size: Some(OBSTACLE_SIZE),
                     ..default()
                 },
-                transform: Transform {
-                    translation: obstacle_pos,
-                    ..default()
-                },
+                transform: Transform::from_translation(obstacle_pos),
                 ..default()
             },
             Obstacle,
@@ -210,20 +220,18 @@ fn spawn_obstacles(
     }
 }
 
-fn update_score_system(score: Res<Score>, mut query: Query<&mut Text, With<ScoreText>>) {
-    if score.is_changed() {
-        for mut text in query.iter_mut() {
-            text.sections[0].value = format!("Score: {}", score.0);
-        }
-    }
-}
+//
+// GAMEPLAY SYSTEMS
+//
 
+/// Processes player input for movement and jumping.
 fn player_input_system(
     keyboard_input: Res<Input<KeyCode>>,
     mut query: Query<(&mut Velocity, &mut Transform), With<Player>>,
     ground_data: Res<GroundData>,
 ) {
     for (mut velocity, mut transform) in query.iter_mut() {
+        // Horizontal movement.
         let mut direction = 0.0;
         if keyboard_input.pressed(KeyCode::Left) || keyboard_input.pressed(KeyCode::A) {
             direction -= 1.0;
@@ -231,26 +239,24 @@ fn player_input_system(
         if keyboard_input.pressed(KeyCode::Right) || keyboard_input.pressed(KeyCode::D) {
             direction += 1.0;
         }
-        let speed = 200.0;
-        velocity.x = direction * speed;
+        velocity.x = direction * PLAYER_SPEED;
 
-        // Flip sprite based on movement direction.
-        if direction < 0.0 {
-            transform.scale.x = transform.scale.x.abs() * -1.0;
-        } else if direction > 0.0 {
-            transform.scale.x = transform.scale.x.abs();
+        // Flip sprite based on direction.
+        if direction != 0.0 {
+            transform.scale.x = transform.scale.x.abs() * direction.signum();
         }
 
-        // Allow jumping if the player's bottom is on or below the ground.
+        // Jump if on the ground.
         if (keyboard_input.just_pressed(KeyCode::Space)
             || keyboard_input.just_pressed(KeyCode::Key2))
-            && transform.translation.y <= ground_data.top_y + 15.0
+            && transform.translation.y <= ground_data.top_y + PLAYER_SIZE.y / 2.0
         {
-            velocity.y = 300.0;
+            velocity.y = PLAYER_JUMP_VELOCITY;
         }
     }
 }
 
+/// Applies gravity to the player.
 fn apply_gravity_system(
     time: Res<Time>,
     gravity: Res<Gravity>,
@@ -261,22 +267,20 @@ fn apply_gravity_system(
     }
 }
 
+/// Moves all entities based on their velocity.
 fn movement_system(time: Res<Time>, mut query: Query<(&mut Transform, &Velocity)>) {
     for (mut transform, velocity) in query.iter_mut() {
-        transform.translation.x += velocity.x * time.delta_seconds();
-        transform.translation.y += velocity.y * time.delta_seconds();
+        transform.translation += (velocity.0 * time.delta_seconds()).extend(0.0);
     }
 }
 
 /// Wraps the player around the screen horizontally.
-/// If the player moves beyond one side, it reappears on the opposite side.
 fn player_wrap_system(
     window_query: Query<&Window, With<PrimaryWindow>>,
     mut query: Query<&mut Transform, With<Player>>,
 ) {
     let window = window_query.single();
     let half_width = window.width() / 2.0;
-
     for mut transform in query.iter_mut() {
         if transform.translation.x > half_width {
             transform.translation.x = -half_width;
@@ -286,17 +290,39 @@ fn player_wrap_system(
     }
 }
 
+/// Wraps enemies around the screen horizontally.
+fn enemy_wrap_system(
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    mut query: Query<&mut Transform, With<Enemy>>,
+) {
+    let window = window_query.single();
+    let half_width = window.width() / 2.0;
+    for mut transform in query.iter_mut() {
+        if transform.translation.x > half_width {
+            transform.translation.x = -half_width;
+        } else if transform.translation.x < -half_width {
+            transform.translation.x = half_width;
+        }
+    }
+}
+
+/// Helper function for AABB collision detection.
+fn is_colliding(pos_a: Vec3, half_a: Vec2, pos_b: Vec3, half_b: Vec2) -> bool {
+    (pos_a.x - half_a.x < pos_b.x + half_b.x)
+        && (pos_a.x + half_a.x > pos_b.x - half_b.x)
+        && (pos_a.y - half_a.y < pos_b.y + half_b.y)
+        && (pos_a.y + half_a.y > pos_b.y - half_b.y)
+}
+
+/// Keeps the player on the ground if falling below it.
 fn collision_system(
-    mut query: Query<(&mut Transform, &mut Velocity), With<Player>>, 
-    ground_data: Res<GroundData>
+    mut query: Query<(&mut Transform, &mut Velocity), With<Player>>,
+    ground_data: Res<GroundData>,
 ) {
     for (mut transform, mut velocity) in query.iter_mut() {
-        let player_half_height = 15.0;
-        let ground_top = ground_data.top_y;
-
-        // Snap the player to the ground if falling below it.
-        if transform.translation.y - player_half_height < ground_top {
-            transform.translation.y = ground_top + player_half_height;
+        let player_half = PLAYER_SIZE.y / 2.0;
+        if transform.translation.y - player_half < ground_data.top_y {
+            transform.translation.y = ground_data.top_y + player_half;
             if velocity.y < 0.0 {
                 velocity.y = 0.0;
             }
@@ -304,6 +330,7 @@ fn collision_system(
     }
 }
 
+/// Handles collisions between the player and enemies.
 fn enemy_collision_system(
     mut commands: Commands,
     mut score: ResMut<Score>,
@@ -313,34 +340,30 @@ fn enemy_collision_system(
     player_entity_query: Query<Entity, With<Player>>,
 ) {
     for (player_transform, player_sprite) in player_query.iter() {
-        let player_pos = player_transform.translation;
-        let player_half = if let Some(size) = player_sprite.custom_size {
-            size / 2.0
-        } else {
-            Vec2::new(15.0, 15.0)
-        };
-
+        let player_half = player_sprite
+            .custom_size
+            .unwrap_or(PLAYER_SIZE)
+            / 2.0;
         for (enemy_entity, enemy_transform, enemy_sprite) in enemy_query.iter() {
-            let enemy_pos = enemy_transform.translation;
-            let enemy_half = if let Some(size) = enemy_sprite.custom_size {
-                size / 2.0
-            } else {
-                Vec2::new(15.0, 15.0)
-            };
-
-            let collision = (player_pos.x - player_half.x < enemy_pos.x + enemy_half.x)
-                && (player_pos.x + player_half.x > enemy_pos.x - enemy_half.x)
-                && (player_pos.y - player_half.y < enemy_pos.y + enemy_half.y)
-                && (player_pos.y + player_half.y > enemy_pos.y - enemy_half.y);
-
-            if collision {
-                // If collision is from above (stomp), despawn the enemy and update score.
-                if player_pos.y - player_half.y >= enemy_pos.y + enemy_half.y - 5.0 {
+            let enemy_half = enemy_sprite
+                .custom_size
+                .unwrap_or(ENEMY_SIZE)
+                / 2.0;
+            if is_colliding(
+                player_transform.translation,
+                Vec2::splat(player_half.x),
+                enemy_transform.translation,
+                Vec2::splat(enemy_half.x),
+            ) {
+                // Stomp enemy if player is above.
+                if player_transform.translation.y - player_half.y
+                    >= enemy_transform.translation.y + enemy_half.y - 5.0
+                {
                     commands.entity(enemy_entity).despawn();
                     score.0 += 100;
                     info!("Enemy defeated! Score: {}", score.0);
                 } else {
-                    // Otherwise, show game over and despawn the player.
+                    // Game over scenario.
                     commands.spawn(TextBundle {
                         text: Text::from_section(
                             "Game Over",
@@ -368,43 +391,57 @@ fn enemy_collision_system(
     }
 }
 
+fn enemy_obstacle_collision_system(
+    mut enemy_query: Query<(&Transform, &mut Velocity), With<Enemy>>,
+    obstacle_query: Query<&Transform, With<Obstacle>>,
+) {
+    for (enemy_transform, mut enemy_velocity) in enemy_query.iter_mut() {
+        // Define enemy half size (assuming enemy sprite uses ENEMY_SIZE)
+        let enemy_half = ENEMY_SIZE / 2.0;
+        for obstacle_transform in obstacle_query.iter() {
+            // Define obstacle half size (assuming obstacle sprite uses OBSTACLE_SIZE)
+            let obstacle_half = OBSTACLE_SIZE / 2.0;
+            let enemy_pos = enemy_transform.translation;
+            let obstacle_pos = obstacle_transform.translation;
+            // Basic AABB collision detection
+            let collision = (enemy_pos.x - enemy_half.x < obstacle_pos.x + obstacle_half.x)
+                && (enemy_pos.x + enemy_half.x > obstacle_pos.x - obstacle_half.x)
+                && (enemy_pos.y - enemy_half.y < obstacle_pos.y + obstacle_half.y)
+                && (enemy_pos.y + enemy_half.y > obstacle_pos.y - obstacle_half.y);
+            if collision {
+                // Invert the horizontal velocity if a collision is detected.
+                enemy_velocity.x = -enemy_velocity.x;
+            }
+        }
+    }
+}
+
+
+/// Handles collisions between the player and obstacles.
 fn obstacle_collision_system(
     mut param_set: ParamSet<(
         Query<(&mut Transform, &mut Velocity, &Sprite), With<Player>>,
         Query<&Transform, With<Obstacle>>,
     )>,
 ) {
-    // Collect obstacle positions.
     let obstacles: Vec<Vec3> = param_set.p1().iter().map(|t| t.translation).collect();
 
     for (mut player_transform, mut player_velocity, player_sprite) in param_set.p0().iter_mut() {
-        let player_pos = player_transform.translation;
-        let player_half = if let Some(size) = player_sprite.custom_size {
-            size / 2.0
-        } else {
-            Vec2::new(15.0, 15.0)
-        };
-
+        let player_half = player_sprite.custom_size.unwrap_or(PLAYER_SIZE) / 2.0;
         for &obstacle_pos in &obstacles {
-            let obstacle_half = Vec2::new(20.0, 20.0);
-
-            let collision_x = (player_pos.x - player_half.x < obstacle_pos.x + obstacle_half.x)
-                && (player_pos.x + player_half.x > obstacle_pos.x - obstacle_half.x);
-            let collision_y = (player_pos.y - player_half.y < obstacle_pos.y + obstacle_half.y)
-                && (player_pos.y + player_half.y > obstacle_pos.y - obstacle_half.y);
-
-            if collision_x && collision_y {
-                if player_pos.x < obstacle_pos.x {
+            let obstacle_half = OBSTACLE_SIZE / 2.0;
+            if is_colliding(player_transform.translation, player_half, obstacle_pos, obstacle_half) {
+                // Prevent horizontal overlap.
+                if player_transform.translation.x < obstacle_pos.x {
                     player_transform.translation.x =
                         obstacle_pos.x - obstacle_half.x - player_half.x;
                 } else {
                     player_transform.translation.x =
                         obstacle_pos.x + obstacle_half.x + player_half.x;
                 }
-
                 player_velocity.x = 0.0;
-
-                if player_pos.y > obstacle_pos.y {
+                // Adjust vertical position if needed.
+                if player_transform.translation.y > obstacle_pos.y {
                     player_transform.translation.y =
                         obstacle_pos.y + obstacle_half.y + player_half.y;
                 }
@@ -413,12 +450,63 @@ fn obstacle_collision_system(
     }
 }
 
+/// Updates the UI score text when the score changes.
+fn update_score_system(score: Res<Score>, mut query: Query<&mut Text, With<ScoreText>>) {
+    if score.is_changed() {
+        for mut text in query.iter_mut() {
+            text.sections[0].value = format!("Score: {}", score.0);
+        }
+    }
+}
+
+/// Ends the game when either all enemies are defeated or the player is gone.
 fn check_end_game_system(
     enemy_query: Query<Entity, With<Enemy>>,
     player_query: Query<Entity, With<Player>>,
+    asset_server: Res<AssetServer>,
+    mut commands: Commands,
     mut exit: EventWriter<AppExit>,
 ) {
-    if enemy_query.is_empty() || player_query.is_empty() {
+    if enemy_query.is_empty() {
+        // Spawn a win title if no enemies remain.
+        commands.spawn(TextBundle {
+            text: Text::from_section(
+                "You Win!",
+                TextStyle {
+                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                    font_size: 80.0,
+                    color: Color::GREEN,
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Percent(40.0),
+                left: Val::Percent(35.0),
+                ..default()
+            },
+            ..default()
+        });
+        exit.send(AppExit);
+    } else if player_query.is_empty() {
+        // Spawn a game over title if the player is gone.
+        commands.spawn(TextBundle {
+            text: Text::from_section(
+                "Game Over",
+                TextStyle {
+                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                    font_size: 80.0,
+                    color: Color::RED,
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Percent(40.0),
+                left: Val::Percent(35.0),
+                ..default()
+            },
+            ..default()
+        });
         exit.send(AppExit);
     }
 }
+
