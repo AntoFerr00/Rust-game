@@ -71,8 +71,9 @@ fn setup(
     let window = window_query.single();
     let ground_height = 20.0;
     // Calculate ground center and top positions.
-    let ground_center_y = -window.height() / 2.0 + ground_height / 2.0;
-    let ground_top_y = ground_center_y + ground_height / 2.0;
+    // Place the ground so that its center is exactly at y = 0
+    let ground_center_y = 0.0; 
+    let ground_top_y = ground_center_y + ground_height / 2.0; // This ends up being ground_height / 2.0
 
     commands.insert_resource(GroundData {
         center_y: ground_center_y,
@@ -92,7 +93,7 @@ fn setup(
                 ..default()
             },
             transform: Transform {
-                translation: Vec3::new(0.0, ground_center_y, 0.0),
+                translation: Vec3::new(0.0, 0.0, 0.0),
                 ..default()
             },
             ..default()
@@ -132,7 +133,7 @@ fn setup(
                 ..default()
             },
             transform: Transform {
-                translation: Vec3::new(0.0, ground_top_y + 15.0, 0.0),
+                translation: Vec3::new(0.0, 0.0, 0.0),
                 ..default()
             },
             ..default()
@@ -147,72 +148,32 @@ fn spawn_enemies(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     ground_data: Res<GroundData>,
-    obstacle_query: Query<&Transform, With<Obstacle>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
 ) {
     let window = window_query.single();
     let mut rng = rand::thread_rng();
     let enemy_count = rng.gen_range(2..5);
-
-    let ground_top = ground_data.top_y;
     let enemy_height = 30.0;
-    let enemy_half_height = enemy_height / 2.0;
-
-    // Gather obstacle positions and sizes.
-    let obstacle_data: Vec<(Vec3, Vec2)> = obstacle_query
-        .iter()
-        .map(|t| (t.translation, Vec2::new(40.0, 40.0)))
-        .collect();
 
     for _ in 0..enemy_count {
-        let mut spawn_tries = 0;
-        let max_tries = 200;
-        let mut spawned = false;
+        let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
+        let enemy_pos = Vec3::new(x, ground_data.top_y + enemy_height / 2.0, 0.0);
 
-        while spawn_tries < max_tries && !spawned {
-            let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
-            let candidate_pos = Vec3::new(x, ground_top + enemy_half_height, 0.0);
-
-            // Check for collision with obstacles.
-            let mut valid_position = true;
-            for (obstacle_pos, obstacle_size) in &obstacle_data {
-                let obstacle_half = *obstacle_size / 2.0;
-                let enemy_half = Vec2::new(enemy_half_height, enemy_half_height);
-                let collision_x = (candidate_pos.x - enemy_half.x)
-                    < (obstacle_pos.x + obstacle_half.x)
-                    && (candidate_pos.x + enemy_half.x)
-                        > (obstacle_pos.x - obstacle_half.x);
-                let collision_y = (candidate_pos.y - enemy_half.y)
-                    < (obstacle_pos.y + obstacle_half.y)
-                    && (candidate_pos.y + enemy_half.y)
-                        > (obstacle_pos.y - obstacle_half.y);
-
-                if collision_x && collision_y {
-                    valid_position = false;
-                    break;
-                }
-            }
-
-            if valid_position {
-                commands.spawn((
-                    SpriteBundle {
-                        texture: asset_server.load("enemy.png"),
-                        sprite: Sprite {
-                            custom_size: Some(Vec2::new(30.0, 30.0)),
-                            ..default()
-                        },
-                        transform: Transform {
-                            translation: candidate_pos,
-                            ..default()
-                        },
-                        ..default()
-                    },
-                    Enemy,
-                ));
-                spawned = true;
-            }
-            spawn_tries += 1;
-        }
+        commands.spawn((
+            SpriteBundle {
+                texture: asset_server.load("enemy.png"),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::new(30.0, enemy_height)),
+                    ..default()
+                },
+                transform: Transform {
+                    translation: enemy_pos,
+                    ..default()
+                },
+                ..default()
+            },
+            Enemy,
+        ));
     }
 }
 
@@ -225,24 +186,21 @@ fn spawn_obstacles(
     let window = window_query.single();
     let mut rng = rand::thread_rng();
     let obstacle_count = rng.gen_range(3..7);
-
-    let ground_top = ground_data.top_y;
+    let obstacle_height = 40.0;
 
     for _ in 0..obstacle_count {
-        let obstacle_height = 40.0;
-        let obstacle_half_height = obstacle_height / 2.0;
-        let obstacle_center_y = ground_top + obstacle_half_height;
-
         let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
+        let obstacle_pos = Vec3::new(x, ground_data.top_y + (obstacle_height / 2.0), 0.0);
+        
         commands.spawn((
             SpriteBundle {
                 sprite: Sprite {
                     color: Color::DARK_GRAY,
-                    custom_size: Some(Vec2::new(40.0, 40.0)),
+                    custom_size: Some(Vec2::new(40.0, obstacle_height)),
                     ..default()
                 },
                 transform: Transform {
-                    translation: Vec3::new(x, obstacle_center_y, 0.0),
+                    translation: obstacle_pos,
                     ..default()
                 },
                 ..default()
